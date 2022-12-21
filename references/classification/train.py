@@ -1,8 +1,19 @@
+# Run: train.py
+# or: torchrun --nproc_per_node=8 train.py
+# or: start the batch job
+# Includes default args:
+#   --train-path gs://nvdata-openimages
+#   --model resnet50
+#   --use-torchsnapshot
+#   --output-dir gs://imagenette2_checkpoints/openimages
+#   --workers 10
+
 import datetime
 import os
 import time
 import warnings
 
+import open_images
 import presets
 import torch
 import torch.utils.data
@@ -13,6 +24,9 @@ from sampler import RASampler
 from torch import nn
 from torch.utils.data.dataloader import default_collate
 from torchvision.transforms.functional import InterpolationMode
+from torchsnapshot import Snapshot
+import webdataset as wds
+import open_images
 
 
 def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema=None, scaler=None):
@@ -22,8 +36,8 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
     metric_logger.add_meter("img/s", utils.SmoothedValue(window_size=10, fmt="{value}"))
 
     header = f"Epoch: [{epoch}]"
+    start_time = time.time()
     for i, (image, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
-        start_time = time.time()
         image, target = image.to(device), target.to(device)
         with torch.cuda.amp.autocast(enabled=scaler is not None):
             output = model(image)
@@ -51,12 +65,12 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
                 model_ema.n_averaged.fill_(0)
 
         acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
-        batch_size = image.shape[0]
+        batch_size = image.shape[0] * utils.get_world_size()
         metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
         metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
         metric_logger.meters["acc5"].update(acc5.item(), n=batch_size)
         metric_logger.meters["img/s"].update(batch_size / (time.time() - start_time))
-
+        start_time = time.time()
 
 def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix=""):
     model.eval()
@@ -109,6 +123,23 @@ def _get_cache_path(filepath):
     cache_path = os.path.expanduser(cache_path)
     return cache_path
 
+def load_openimages_webdataset(data_dir, data_xform):
+    url = os.path.join(data_dir, open_images.WEB_DATASET_PATTERN)
+
+    def remap_label(x):
+        return open_images.CLASS_TO_IDX[x[0]['LabelName']]
+
+    ds = (wds.WebDataset(url, nodesplitter=wds.split_by_worker, shardshuffle=True)
+        .shuffle(1000)
+        .decode("pilrgb")
+        .to_tuple("jpg", "json")
+        .map_tuple(data_xform, remap_label)
+        .with_length(1743000 // utils.get_world_size())
+    )
+
+    ds.classes = list(open_images.CLASS_TO_IDX.values())
+    return ds
+
 
 def load_data(traindir, valdir, args):
     # Data loading code
@@ -120,42 +151,25 @@ def load_data(traindir, valdir, args):
     )
     interpolation = InterpolationMode(args.interpolation)
 
-    print("Loading training data")
-    st = time.time()
-    cache_path = _get_cache_path(traindir)
-    if args.cache_dataset and os.path.exists(cache_path):
-        # Attention, as the transforms are also cached!
-        print(f"Loading dataset_train from {cache_path}")
-        dataset, _ = torch.load(cache_path)
-    else:
-        auto_augment_policy = getattr(args, "auto_augment", None)
-        random_erase_prob = getattr(args, "random_erase", 0.0)
-        ra_magnitude = args.ra_magnitude
-        augmix_severity = args.augmix_severity
-        dataset = torchvision.datasets.ImageFolder(
-            traindir,
-            presets.ClassificationPresetTrain(
-                crop_size=train_crop_size,
-                interpolation=interpolation,
-                auto_augment_policy=auto_augment_policy,
-                random_erase_prob=random_erase_prob,
-                ra_magnitude=ra_magnitude,
-                augmix_severity=augmix_severity,
-            ),
-        )
-        if args.cache_dataset:
-            print(f"Saving dataset_train to {cache_path}")
-            utils.mkdir(os.path.dirname(cache_path))
-            utils.save_on_master((dataset, traindir), cache_path)
-    print("Took", time.time() - st)
+    auto_augment_policy = getattr(args, "auto_augment", None)
+    random_erase_prob = getattr(args, "random_erase", 0.0)
+    ra_magnitude = args.ra_magnitude
+    augmix_severity = args.augmix_severity
+    dataset = load_openimages_webdataset(
+        traindir,
+        presets.ClassificationPresetTrain(
+            crop_size=train_crop_size,
+            interpolation=interpolation,
+            auto_augment_policy=auto_augment_policy,
+            random_erase_prob=random_erase_prob,
+            ra_magnitude=ra_magnitude,
+            augmix_severity=augmix_severity,
+        ),
+    )
 
     print("Loading validation data")
-    cache_path = _get_cache_path(valdir)
-    if args.cache_dataset and os.path.exists(cache_path):
-        # Attention, as the transforms are also cached!
-        print(f"Loading dataset_test from {cache_path}")
-        dataset_test, _ = torch.load(cache_path)
-    else:
+
+    if valdir:
         if args.weights and args.test_only:
             weights = torchvision.models.get_weight(args.weights)
             preprocessing = weights.transforms()
@@ -164,33 +178,18 @@ def load_data(traindir, valdir, args):
                 crop_size=val_crop_size, resize_size=val_resize_size, interpolation=interpolation
             )
 
-        dataset_test = torchvision.datasets.ImageFolder(
+        dataset_test = load_openimages_webdataset(
             valdir,
             preprocessing,
         )
-        if args.cache_dataset:
-            print(f"Saving dataset_test to {cache_path}")
-            utils.mkdir(os.path.dirname(cache_path))
-            utils.save_on_master((dataset_test, valdir), cache_path)
+    else:
+        dataset_test = None
 
     print("Creating data loaders")
-    if args.distributed:
-        if hasattr(args, "ra_sampler") and args.ra_sampler:
-            train_sampler = RASampler(dataset, shuffle=True, repetitions=args.ra_reps)
-        else:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-        test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test, shuffle=False)
-    else:
-        train_sampler = torch.utils.data.RandomSampler(dataset)
-        test_sampler = torch.utils.data.SequentialSampler(dataset_test)
-
-    return dataset, dataset_test, train_sampler, test_sampler
+    return dataset, dataset_test
 
 
 def main(args):
-    if args.output_dir:
-        utils.mkdir(args.output_dir)
-
     utils.init_distributed_mode(args)
     print(args)
 
@@ -202,9 +201,7 @@ def main(args):
     else:
         torch.backends.cudnn.benchmark = True
 
-    train_dir = os.path.join(args.data_path, "train")
-    val_dir = os.path.join(args.data_path, "val")
-    dataset, dataset_test, train_sampler, test_sampler = load_data(train_dir, val_dir, args)
+    dataset, dataset_test = load_data(args.train_path, args.val_path, args)
 
     collate_fn = None
     num_classes = len(dataset.classes)
@@ -222,14 +219,13 @@ def main(args):
     data_loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
-        sampler=train_sampler,
         num_workers=args.workers,
         pin_memory=True,
         collate_fn=collate_fn,
     )
     data_loader_test = torch.utils.data.DataLoader(
-        dataset_test, batch_size=args.batch_size, sampler=test_sampler, num_workers=args.workers, pin_memory=True
-    )
+        dataset_test, batch_size=args.batch_size, num_workers=args.workers, pin_memory=True
+    ) if dataset_test else None
 
     print("Creating model")
     model = torchvision.models.get_model(args.model, weights=args.weights, num_classes=num_classes)
@@ -350,27 +346,24 @@ def main(args):
     print("Start training")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
+        # TODO: deterministic shuffling for the webdataset
+        # if args.distributed and train_sampler:
+        #     train_sampler.set_epoch(epoch)
         train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema, scaler)
         lr_scheduler.step()
-        evaluate(model, criterion, data_loader_test, device=device)
-        if model_ema:
-            evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
+        if data_loader_test:
+            evaluate(model, criterion, data_loader_test, device=device)
+            if model_ema:
+                evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
         if args.output_dir:
             checkpoint = {
-                "model": model_without_ddp.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "lr_scheduler": lr_scheduler.state_dict(),
-                "epoch": epoch,
-                "args": args,
+                "model": model_without_ddp,
+                "optimizer": optimizer,
+                "lr_scheduler": lr_scheduler,
             }
-            if model_ema:
-                checkpoint["model_ema"] = model_ema.state_dict()
-            if scaler:
-                checkpoint["scaler"] = scaler.state_dict()
-            utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
-            utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
+
+            Snapshot.take(path=os.path.join(args.output_dir, f"model_{epoch}"), app_state=checkpoint)
+            Snapshot.take(path=os.path.join(args.output_dir, "checkpoint"), app_state=checkpoint)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -382,15 +375,16 @@ def get_args_parser(add_help=True):
 
     parser = argparse.ArgumentParser(description="PyTorch Classification Training", add_help=add_help)
 
-    parser.add_argument("--data-path", default="/datasets01/imagenet_full_size/061417/", type=str, help="dataset path")
-    parser.add_argument("--model", default="resnet18", type=str, help="model name")
+    parser.add_argument("--train-path", default="gs://nvdata-openimages", type=str, help="dataset path")
+    parser.add_argument("--val-path", default="", type=str, help="validation dataset path")
+    parser.add_argument("--model", default="resnet50", type=str, help="model name")
     parser.add_argument("--device", default="cuda", type=str, help="device (Use cuda or cpu Default: cuda)")
     parser.add_argument(
         "-b", "--batch-size", default=32, type=int, help="images per gpu, the total batch size is $NGPU x batch_size"
     )
     parser.add_argument("--epochs", default=90, type=int, metavar="N", help="number of total epochs to run")
     parser.add_argument(
-        "-j", "--workers", default=16, type=int, metavar="N", help="number of data loading workers (default: 16)"
+        "-j", "--workers", default=10, type=int, metavar="N", help="number of data loading workers (default: 10)"
     )
     parser.add_argument("--opt", default="sgd", type=str, help="optimizer")
     parser.add_argument("--lr", default=0.1, type=float, help="initial learning rate")
@@ -437,15 +431,9 @@ def get_args_parser(add_help=True):
     parser.add_argument("--lr-gamma", default=0.1, type=float, help="decrease lr by a factor of lr-gamma")
     parser.add_argument("--lr-min", default=0.0, type=float, help="minimum lr of lr schedule (default: 0.0)")
     parser.add_argument("--print-freq", default=10, type=int, help="print frequency")
-    parser.add_argument("--output-dir", default=".", type=str, help="path to save outputs")
+    parser.add_argument("--output-dir", default="gs://imagenette2_checkpoints/openimages", type=str, help="path to save outputs")
     parser.add_argument("--resume", default="", type=str, help="path of checkpoint")
     parser.add_argument("--start-epoch", default=0, type=int, metavar="N", help="start epoch")
-    parser.add_argument(
-        "--cache-dataset",
-        dest="cache_dataset",
-        help="Cache the datasets for quicker initialization. It also serializes the transforms",
-        action="store_true",
-    )
     parser.add_argument(
         "--sync-bn",
         dest="sync_bn",
